@@ -32,6 +32,7 @@ import {
   requireAcceptedPublishedEvent,
   type ActivityState,
 } from './activity-reconciliation';
+import { appearanceForSettings } from './appearance-selection';
 import {
   eventRoutingFromConfig,
   hybridReadRelayHints,
@@ -113,6 +114,7 @@ const DAY = 86_400;
 const DOCTOR_DISCOVERY_LOOKBACK = 7 * DAY;
 const FUTURE_TOLERANCE = 600;
 const PROFILE_HEALTH_MAX = 8;
+const PROFILE_RESOURCE_TIMEOUT_MS = 2_500;
 const GIGI_PROFILE_HEALTH_URL =
   'https://github.com/dergigi/napplet-workshop/tree/master/profile-health';
 const HABITAT_EVENT_KINDS = new Set([
@@ -161,6 +163,7 @@ type Modal =
   | 'viewer'
   | null;
 type ProfileCheckStatus = 'pass' | 'warn' | 'fail' | 'unavailable';
+type ProfileHealthStatus = 'pending' | 'ready' | 'unavailable';
 type RelayPermissions = Record<string, { read: boolean; write: boolean }>;
 
 type Appearance = {
@@ -294,8 +297,11 @@ let profileEvents: NostrEvent[] = [];
 let verifiedMedicineIds = new Set<string>();
 let activeBirth: Birth | null = null;
 let appearance: Appearance = { ...DEFAULT_APPEARANCE };
+let pendingAppearance: Appearance | null = null;
+let appearanceMutationGeneration = 0;
 let health: Health | null = null;
 let profileHealth: ProfileHealth = { ...EMPTY_PROFILE_HEALTH };
+let profileHealthStatus: ProfileHealthStatus = 'pending';
 let fallbackRelayUrls: string[] = [];
 let readRelayHints: string[] = [];
 let relayPlanSource: RelayPlanSource = 'pending';
@@ -503,8 +509,18 @@ async function openHabitatSource(): Promise<void> {
   }
 }
 
+async function readProfileResource(url: string): Promise<Blob> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), PROFILE_RESOURCE_TIMEOUT_MS);
+  try {
+    return await resource.bytes(url, { signal: controller.signal });
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 async function readJsonResource(url: string): Promise<Record<string, unknown>> {
-  const blob = await resource.bytes(url);
+  const blob = await readProfileResource(url);
   const parsed: unknown = JSON.parse(await blob.text());
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('Invalid JSON response');
@@ -623,7 +639,7 @@ async function checkProfileImage(
   }
 
   try {
-    const blob = await resource.bytes(rawUrl);
+    const blob = await readProfileResource(rawUrl);
     const host = url.hostname.toLowerCase();
     const hosting = BLOSSOM_HOSTS.has(host)
       ? 'Blossom'
@@ -819,7 +835,10 @@ function reduceHealth(birth: Birth, at: number): Health {
     daySeconds: DAY,
   });
   const habitat = reduceHabitatSickness({
-    incomplete: profileHealth.tier === 'incomplete',
+    // A pending or unavailable Habitat assessment is neutral. Slow optional
+    // resource checks must never make the pet sick before they finish.
+    incomplete:
+      profileHealthStatus === 'ready' && profileHealth.tier === 'incomplete',
     birthCreatedAt: birth.event.created_at,
     lastHabitatChangeAt: latestHabitatChangeAt(birth, at),
     lastMedicineAt: latestMedicineAt(birth, at),
@@ -905,13 +924,13 @@ async function loadAppearance(birth: Birth): Promise<Appearance> {
   }
 }
 
-async function restorePreview(): Promise<void> {
-  previewState = null;
+async function storedPreview(): Promise<PetState | null> {
   try {
     const saved = await storage.getItem('pet-preview-state');
-    if (saved && saved in STATE_META) previewState = saved as PetState;
+    return saved && saved in STATE_META ? saved as PetState : null;
   } catch {
     // Optional shell storage is a convenience, never a requirement.
+    return null;
   }
 }
 
@@ -1338,40 +1357,18 @@ async function setupEventRouting(): Promise<void> {
   }
 }
 
-async function load(): Promise<void> {
-  loadGeneration += 1;
-  // Any pending optional reaction context belongs to the previous pet/session.
-  reactionEnrichmentGeneration += 1;
-  loading = true;
-  message = '';
-  incompleteSync = false;
-  pubkey = viewedPubkey || connectedPubkey;
-  resetLiveDegradation();
-  closeLiveChannels();
-  render();
+function currentLoad(generation: number, owner: string): boolean {
+  return generation === loadGeneration && owner === pubkey;
+}
 
+async function hydratePetDetails(
+  generation: number,
+  owner: string,
+  ownerIsSigner: boolean,
+  startedAt: number,
+): Promise<void> {
   try {
-    connectedPubkey = await identity.getPublicKey();
-    if (viewedPubkey && viewedPubkey === connectedPubkey) viewedPubkey = '';
-    pubkey = viewedPubkey || connectedPubkey;
-    if (!pubkey) {
-      accountFollows = [];
-      births = [];
-      notes = [];
-      profileEvents = [];
-      activeBirth = null;
-      health = null;
-      profileHealth = { ...EMPTY_PROFILE_HEALTH };
-      fallbackRelayUrls = [];
-      readRelayHints = [];
-      relayPlanSource = 'pending';
-      loading = false;
-      render();
-      return;
-    }
-
-    const ownerIsSigner = pubkey === connectedPubkey;
-    await prepareReadRelayPlan(pubkey);
+    const appearanceGeneration = appearanceMutationGeneration;
     const profilePromise = eventRouting.localRelayOnly || !ownerIsSigner
       ? Promise.resolve(null)
       : identity.getProfile().catch((error) => {
@@ -1387,32 +1384,31 @@ async function load(): Promise<void> {
     const profileHealthEventsPromise = queryPetEvents(
       [
         {
-          authors: [pubkey],
+          authors: [owner],
           kinds: [0, 3, 10_002, 10_019, 10_050, 17_375, 37_375],
           limit: 20,
         },
       ],
-      { authors: [pubkey], limit: 20, timeoutMs: 8_000 },
+      { authors: [owner], limit: 20, timeoutMs: 8_000 },
     );
-    const birthPromise = queryPetEvents(
-      [{ authors: [pubkey], kinds: [78], '#d': [BIRTH_D], limit: 100 }],
-      { authors: [pubkey], limit: 100, timeoutMs: 6_000 },
-    );
-    const notePromise = queryPetEvents([{ authors: [pubkey], kinds: [1], limit: 500 }], {
-      authors: [pubkey],
-      limit: 500,
-      timeoutMs: 8_000,
-    });
+    const appearancePromise = activeBirth
+      ? loadAppearance(activeBirth)
+      : Promise.resolve({ ...DEFAULT_APPEARANCE });
+    const previewPromise = isViewingAnotherPet()
+      ? Promise.resolve(null)
+      : storedPreview();
 
-    const [profile, follows, identityRelays, profileHealthResult, birthResult, noteResult] =
+    const [profile, follows, identityRelays, profileHealthResult, nextAppearance, nextPreview] =
       await Promise.all([
         profilePromise,
         followsPromise,
         relaysPromise,
         profileHealthEventsPromise,
-        birthPromise,
-        notePromise,
+        appearancePromise,
+        previewPromise,
       ]);
+    if (!currentLoad(generation, owner)) return;
+
     profileEvents = profileHealthResult.events.map((item) => item.event);
     const relayListEvent = latestEvent(profileEvents, 10_002);
     const eventProfile = profileFromEvent(latestEvent(profileEvents, 0));
@@ -1420,8 +1416,16 @@ async function load(): Promise<void> {
     const currentProfile = eventProfile ?? profile;
     const currentFollows = eventFollows ?? follows;
     const currentRelays = relaysFromEvent(relayListEvent) ?? identityRelays;
-    accountFollows = currentFollows;
+    const nextProfileHealth = await calculateProfileHealth(
+      owner,
+      currentProfile,
+      currentFollows,
+      currentRelays,
+      profileEvents,
+    );
+    if (!currentLoad(generation, owner)) return;
 
+    accountFollows = currentFollows;
     if (!ownerIsSigner) {
       fallbackRelayUrls = [];
     } else if (eventRouting.localRelayOnly) {
@@ -1430,43 +1434,120 @@ async function load(): Promise<void> {
       const writableIdentityRelays = Object.entries(identityRelays)
         .filter(([, permissions]) => permissions.write)
         .map(([url]) => url);
-      fallbackRelayUrls = uniqueRelayUrls(
-        [
-          ...(eventRouting.localRelayMirror ? [eventRouting.localRelayUrl] : []),
-          ...(writableIdentityRelays.length
-            ? writableIdentityRelays
-            : DEFAULT_PUBLISH_RELAYS),
-        ],
-      );
+      fallbackRelayUrls = uniqueRelayUrls([
+        ...(eventRouting.localRelayMirror ? [eventRouting.localRelayUrl] : []),
+        ...(writableIdentityRelays.length
+          ? writableIdentityRelays
+          : DEFAULT_PUBLISH_RELAYS),
+      ]);
     }
-    incompleteSync = Boolean(
-      profileHealthResult.incomplete || birthResult.incomplete || noteResult.incomplete,
+    incompleteSync ||= Boolean(profileHealthResult.incomplete);
+    profileHealth = nextProfileHealth;
+    profileHealthStatus = 'ready';
+    if (appearanceGeneration === appearanceMutationGeneration) {
+      appearance = nextAppearance;
+    }
+    previewState = nextPreview;
+    // Habitat enrichment can change Sick status, so derive once more after it
+    // becomes authoritative. It cannot rewrite terminal lineage.
+    activeBirth = resolveLineage();
+    health = activeBirth ? reduceHealth(activeBirth, nowSeconds()) : null;
+    console.log('[nappagochi:startup] optional details hydrated', {
+      ownerPubkey: owner,
+      elapsedMs: Math.round(performance.now() - startedAt),
+      profileTier: profileHealth.tier,
+    });
+    render();
+  } catch (error) {
+    if (!currentLoad(generation, owner)) return;
+    profileHealthStatus = 'unavailable';
+    console.log('[nappagochi:degradation] optional startup details unavailable', {
+      ownerPubkey: owner,
+      reason: error instanceof Error ? error.message : 'detail-sync-failed',
+    });
+    render();
+  }
+}
+
+async function load(): Promise<void> {
+  const generation = ++loadGeneration;
+  const startedAt = performance.now();
+  // Any pending optional reaction context belongs to the previous pet/session.
+  reactionEnrichmentGeneration += 1;
+  loading = true;
+  message = '';
+  incompleteSync = false;
+  profileHealthStatus = 'pending';
+  profileHealth = { ...EMPTY_PROFILE_HEALTH };
+  pubkey = viewedPubkey || connectedPubkey;
+  resetLiveDegradation();
+  closeLiveChannels();
+  render();
+
+  try {
+    connectedPubkey = await identity.getPublicKey();
+    if (generation !== loadGeneration) return;
+    if (viewedPubkey && viewedPubkey === connectedPubkey) viewedPubkey = '';
+    pubkey = viewedPubkey || connectedPubkey;
+    if (!pubkey) {
+      accountFollows = [];
+      births = [];
+      notes = [];
+      profileEvents = [];
+      activeBirth = null;
+      health = null;
+      profileHealth = { ...EMPTY_PROFILE_HEALTH };
+      profileHealthStatus = 'pending';
+      fallbackRelayUrls = [];
+      readRelayHints = [];
+      relayPlanSource = 'pending';
+      loading = false;
+      render();
+      return;
+    }
+
+    const owner = pubkey;
+    const ownerIsSigner = owner === connectedPubkey;
+    await prepareReadRelayPlan(owner);
+    if (!currentLoad(generation, owner)) return;
+    const birthPromise = queryPetEvents(
+      [{ authors: [owner], kinds: [78], '#d': [BIRTH_D], limit: 100 }],
+      { authors: [owner], limit: 100, timeoutMs: 6_000 },
     );
+    const notePromise = queryPetEvents([{ authors: [owner], kinds: [1], limit: 500 }], {
+      authors: [owner],
+      limit: 500,
+      timeoutMs: 8_000,
+    });
+
+    const [birthResult, noteResult] = await Promise.all([birthPromise, notePromise]);
+    if (!currentLoad(generation, owner)) return;
+    incompleteSync = Boolean(birthResult.incomplete || noteResult.incomplete);
     births = birthResult.events
       .map((item) => parseBirth(item.event))
       .filter((birth): birth is Birth => Boolean(birth));
     notes = noteResult.events.map((item) => item.event);
-    // Establish the two live streams immediately after the core history arrives.
-    // Medicine validation, profile scoring, appearance, and preview restoration
-    // are derived/optional work and must not consume the shell's startup burst
-    // budget before the streams that keep the pet alive.
-    beginLiveSubscription();
-    profileHealth = await calculateProfileHealth(
-      pubkey,
-      currentProfile,
-      currentFollows,
-      currentRelays,
-      profileEvents,
-    );
     verifiedMedicineIds = await verifyMedicineEvents(notes);
+    if (!currentLoad(generation, owner)) return;
     activeBirth = resolveLineage();
     health = activeBirth ? reduceHealth(activeBirth, nowSeconds()) : null;
-    appearance = activeBirth ? await loadAppearance(activeBirth) : { ...DEFAULT_APPEARANCE };
-    if (isViewingAnotherPet()) previewState = null;
-    else await restorePreview();
+    appearance = activeBirth ? activeBirth.data.appearance : { ...DEFAULT_APPEARANCE };
+    previewState = null;
+    // Core state is now usable. Render it before profile resources, appearance,
+    // and preferences make any additional shell or network round trips.
+    beginLiveSubscription();
+    loading = false;
+    console.log('[nappagochi:startup] core pet visible', {
+      ownerPubkey: owner,
+      elapsedMs: Math.round(performance.now() - startedAt),
+      hasPet: Boolean(activeBirth),
+    });
+    render();
+    void hydratePetDetails(generation, owner, ownerIsSigner, startedAt);
   } catch (error) {
+    if (generation !== loadGeneration) return;
     message = error instanceof Error ? error.message : 'The Nostr history could not be loaded.';
-  } finally {
+    profileHealthStatus = 'unavailable';
     loading = false;
     render();
   }
@@ -1490,6 +1571,7 @@ function profileTierLabel(tier: ProfileTier): string {
 }
 
 function displayedCondition(state: PetState): { label: string; note: string } {
+  if (profileHealthStatus !== 'ready') return STATE_META[state];
   if (
     state === 'sick' &&
     health?.habitatSick &&
@@ -1790,6 +1872,11 @@ function petHomeMarkup(): string {
       : '';
   const habitatLabel = `<button class="habitat-source-link" type="button" data-action="habitat-source"
     title="View Gigi’s Profile Health source">Habitat</button>`;
+  const habitatValue = profileHealthStatus === 'ready'
+    ? `${profileHealth.score}/${profileHealth.max} · ${escapeHtml(profileTierLabel(profileHealth.tier))}`
+    : profileHealthStatus === 'pending'
+      ? 'Checking…'
+      : 'Unavailable';
   const petStage = readOnly
     ? `<div class="pet-stage pet-stage--readonly">${petMarkup(shownState, appearance, condition.label)}</div>`
     : `<button class="pet-stage" data-action="pet-menu" aria-label="Open pet actions">${petMarkup(shownState, appearance, condition.label)}</button>`;
@@ -1872,7 +1959,7 @@ function petHomeMarkup(): string {
             <dt>${habitatLabel}</dt>
             <dd>
               <button class="text-button habitat-link" data-action="profile">
-                ${profileHealth.score}/${profileHealth.max} · ${escapeHtml(profileTierLabel(profileHealth.tier))}
+                ${habitatValue}
               </button>
             </dd>
           </div>
@@ -1976,23 +2063,24 @@ function habitatSourceModalMarkup(): string {
 }
 
 function settingsModalMarkup(): string {
+  const selectedAppearance = appearanceForSettings(appearance, pendingAppearance);
   return modalFrame(
     'Pet settings',
     `
       <form id="settings-form">
         <fieldset>
           <legend>Color</legend>
-          <div class="swatches">${paletteOptions(appearance.palette)}</div>
+          <div class="swatches">${paletteOptions(selectedAppearance.palette)}</div>
         </fieldset>
         <div class="form-columns">
           <label>Eyes
             <select name="eyes">
-              ${selectOptions(['round', 'sleepy', 'sparkle'], appearance.eyes)}
+              ${selectOptions(['round', 'sleepy', 'sparkle'], selectedAppearance.eyes)}
             </select>
           </label>
           <label>Accessory
             <select name="accessory">
-              ${selectOptions(['none', 'bow', 'hat'], appearance.accessory)}
+              ${selectOptions(['none', 'bow', 'hat'], selectedAppearance.accessory)}
             </select>
           </label>
         </div>
@@ -2050,6 +2138,20 @@ function previewModalMarkup(): string {
 }
 
 function profileModalMarkup(): string {
+  if (profileHealthStatus !== 'ready') {
+    const pending = profileHealthStatus === 'pending';
+    return modalFrame(
+      'Nostr habitat',
+      `
+        <div class="empty-state">
+          <strong>${pending ? 'Checking your Nostr habitat…' : 'Habitat check unavailable'}</strong>
+          <p>${pending
+            ? 'Your pet is already visible while optional profile and resource checks finish in the background.'
+            : 'Activity still controls the pet. Try again after the shell reconnects to Nostr.'}</p>
+        </div>
+      `,
+    );
+  }
   const checks = profileHealth.checks
     .map(
       (check) => `
@@ -2694,6 +2796,7 @@ async function handleSettings(form: HTMLFormElement): Promise<void> {
     accessory: isAllowedAccessory(accessoryValue) ? accessoryValue : 'none',
   };
 
+  pendingAppearance = nextAppearance;
   actionBusy = true;
   render();
   try {
@@ -2709,6 +2812,7 @@ async function handleSettings(form: HTMLFormElement): Promise<void> {
       created_at: nowSeconds(),
     });
     if (!result.ok) throw new Error(result.error || 'The appearance event was not accepted.');
+    appearanceMutationGeneration += 1;
     appearance = nextAppearance;
     modal = null;
     message = 'Appearance saved to Nostr.';
@@ -2716,6 +2820,7 @@ async function handleSettings(form: HTMLFormElement): Promise<void> {
     message = error instanceof Error ? error.message : 'Appearance could not be saved.';
   } finally {
     actionBusy = false;
+    pendingAppearance = null;
     render();
   }
 }
@@ -2778,12 +2883,14 @@ async function start(): Promise<void> {
   applyTheme(FALLBACK_THEME);
   render();
   if (!hasRequiredRuntime()) return;
-  await setupTheme();
-  await setupEventRouting();
-  await restoreSidePanelPreference();
+  // Optional presentation preferences are independent shell calls. Start them
+  // together instead of putting four round trips in front of identity/history.
+  void setupTheme();
+  void restoreSidePanelPreference().then(() => render());
   void setupKeys();
-  await restoreSoundPreference();
+  void restoreSoundPreference();
   document.addEventListener('pointerdown', unlockEnabledSound, { passive: true });
+  await setupEventRouting();
   liveSession = new LiveSessionManager({
     mountedAt: APP_MOUNTED_AT,
     openChannel: openLiveChannel,
