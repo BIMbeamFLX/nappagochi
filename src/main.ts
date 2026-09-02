@@ -81,6 +81,7 @@ import {
 } from './pet-sound';
 import { ReactionMetadataLoader } from './reaction-enrichment';
 import { scoreProfileChecks, type ProfileTier } from './profile-scoring';
+import { readRuntimeConfig } from './runtime-config';
 import './styles.css';
 
 declare global {
@@ -1351,7 +1352,8 @@ async function prepareReadRelayPlan(owner: string): Promise<void> {
 async function setupEventRouting(): Promise<void> {
   eventRouting = eventRoutingFromConfig({});
   try {
-    eventRouting = eventRoutingFromConfig(await config.get());
+    const runtimeConfig = await readRuntimeConfig(config);
+    eventRouting = eventRoutingFromConfig(runtimeConfig);
   } catch {
     eventRouting = eventRoutingFromConfig({});
   }
