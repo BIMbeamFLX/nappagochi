@@ -1,5 +1,14 @@
 # Nappagochi
 
+## Nappelin fork
+
+This is [BIMbeamFLX's Nappelin fork](https://github.com/BIMbeamFLX/nappagochi)
+of [shaibearary/nappagochi](https://github.com/shaibearary/nappagochi).
+The intended integration uses the signed-in member's own avatar in Nappelin Home.
+That avatar adaptation is **not implemented yet**; the behavior documented below
+is the inherited upstream pet. The release link below opens the upstream release,
+not a Nappelin-specific build. Preserve upstream attribution and MIT licensing.
+
 **A small life tied to your Nostr posts.**
 
 Nappagochi is a sandboxed Nostr napplet that turns public activity and profile
